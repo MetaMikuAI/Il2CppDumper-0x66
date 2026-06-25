@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -31,6 +31,7 @@ namespace Il2CppDumper
         public Dictionary<string, ulong[]> codeGenModuleMethodPointers;
         public Dictionary<string, Dictionary<uint, Il2CppRGCTXDefinition[]>> rgctxsDictionary;
         public bool IsDumped;
+        public bool IsAceMetadataLayout;
 
         public abstract ulong MapVATR(ulong addr);
         public abstract ulong MapRTVA(ulong addr);
@@ -209,6 +210,7 @@ namespace Il2CppDumper
                 {
                     var codeGenModule = MapVATR<Il2CppCodeGenModule>(pCodeGenModule);
                     var moduleName = ReadStringToNull(MapVATR(codeGenModule.moduleName));
+                    moduleName = DeobfuscateModuleName(moduleName);
                     codeGenModules.Add(moduleName, codeGenModule);
                     ulong[] methodPointers;
                     try
@@ -229,6 +231,10 @@ namespace Il2CppDumper
                         var rgctxRanges = MapVATR<Il2CppTokenRangePair>(codeGenModule.rgctxRanges, codeGenModule.rgctxRangesCount);
                         foreach (var rgctxRange in rgctxRanges)
                         {
+                            if (rgctxRange.range.start < 0 || rgctxRange.range.length < 0 || rgctxRange.range.start + rgctxRange.range.length > rgctxs.Length)
+                            {
+                                continue;
+                            }
                             var rgctxDefs = new Il2CppRGCTXDefinition[rgctxRange.range.length];
                             Array.Copy(rgctxs, rgctxRange.range.start, rgctxDefs, 0, rgctxRange.range.length);
                             rgctxsDefDictionary.Add(rgctxRange.token, rgctxDefs);
@@ -244,6 +250,10 @@ namespace Il2CppDumper
             methodSpecs = MapVATR<Il2CppMethodSpec>(pMetadataRegistration.methodSpecs, pMetadataRegistration.methodSpecsCount);
             foreach (var table in genericMethodTable)
             {
+                if (table.genericMethodIndex < 0 || table.genericMethodIndex >= methodSpecs.Length || table.indices.methodIndex < 0 || table.indices.methodIndex >= genericMethodPointers.Length)
+                {
+                    continue;
+                }
                 var methodSpec = methodSpecs[table.genericMethodIndex];
                 var methodDefinitionIndex = methodSpec.methodDefinitionIndex;
                 if (!methodDefinitionMethodSpecs.TryGetValue(methodDefinitionIndex, out var list))
@@ -320,13 +330,40 @@ namespace Il2CppDumper
             return type;
         }
 
+        // ACE XORs ~44 of the codeGenModule name strings with 0x39 (NUL terminator becomes '9',
+        // so ReadStringToNull over-reads into following names). Recover by XOR-decoding any name
+        // containing non-filename chars and keeping the first NUL-delimited token.
+        private string DeobfuscateModuleName(string name)
+        {
+            if (!IsAceMetadataLayout)
+                return name;
+            foreach (var c in name)
+            {
+                var ok = c == '.' || c == '_' || c == '-' || c == ' ' ||
+                         (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+                if (!ok)
+                {
+                    var chars = new char[name.Length];
+                    for (var i = 0; i < name.Length; i++)
+                        chars[i] = (char)(name[i] ^ 0x39);
+                    var decoded = new string(chars);
+                    var nul = decoded.IndexOf('\0');
+                    return nul >= 0 ? decoded.Substring(0, nul) : decoded;
+                }
+            }
+            return name;
+        }
+
         public ulong GetMethodPointer(string imageName, Il2CppMethodDefinition methodDef)
         {
             if (Version >= 24.2)
             {
                 var methodToken = methodDef.token;
-                var ptrs = codeGenModuleMethodPointers[imageName];
+                if (!codeGenModuleMethodPointers.TryGetValue(imageName, out var ptrs))
+                    return 0;
                 var methodPointerIndex = methodToken & 0x00FFFFFFu;
+                if (methodPointerIndex == 0 || methodPointerIndex > ptrs.Length)
+                    return 0;
                 return ptrs[methodPointerIndex - 1];
             }
             else

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -16,8 +16,8 @@ namespace Il2CppDumper
         public Il2CppMethodDefinition[] methodDefs;
         public Il2CppParameterDefinition[] parameterDefs;
         public Il2CppFieldDefinition[] fieldDefs;
-        private readonly Dictionary<int, Il2CppFieldDefaultValue> fieldDefaultValuesDic;
-        private readonly Dictionary<int, Il2CppParameterDefaultValue> parameterDefaultValuesDic;
+        private Dictionary<int, Il2CppFieldDefaultValue> fieldDefaultValuesDic;
+        private Dictionary<int, Il2CppParameterDefaultValue> parameterDefaultValuesDic;
         public Il2CppPropertyDefinition[] propertyDefs;
         public Il2CppCustomAttributeTypeRange[] attributeTypeRanges;
         public Il2CppCustomAttributeDataRange[] attributeDataRanges;
@@ -39,15 +39,22 @@ namespace Il2CppDumper
         public Il2CppRGCTXDefinition[] rgctxEntries;
 
         private readonly Dictionary<uint, string> stringCache = new();
+        public bool IsAceMetadataLayout { get; }
 
-        public Metadata(Stream stream) : base(stream)
+        public Metadata(Stream stream, bool useAceMetadataLayout = false) : base(stream)
         {
             var sanity = ReadUInt32();
+            var version = ReadInt32();
+            if (useAceMetadataLayout)
+            {
+                IsAceMetadataLayout = true;
+                InitAceMetadata(sanity, version);
+                return;
+            }
             if (sanity != 0xFAB11BAF)
             {
                 throw new InvalidDataException("ERROR: Metadata file supplied is not valid metadata file.");
             }
-            var version = ReadInt32();
             if (version < 0 || version > 1000)
             {
                 throw new InvalidDataException("ERROR: Metadata file supplied is not valid metadata file.");
@@ -156,6 +163,390 @@ namespace Il2CppDumper
                 rgctxEntries = ReadMetadataClassArray<Il2CppRGCTXDefinition>(header.rgctxEntriesOffset, header.rgctxEntriesCount);
             }
         }
+
+        private void InitAceMetadata(uint firstDword, int version)
+        {
+            if (version < 16 || version > 31)
+            {
+                throw new NotSupportedException($"ERROR: ACE metadata version[{version}] is not supported.");
+            }
+            Version = version;
+            var sections = ReadAceSections(firstDword);
+            header = BuildAceHeader(sections);
+            imageDefs = ReadAceImageDefinitions(header.imagesOffset, sections[20].Count);
+            assemblyDefs = ReadAceAssemblyDefinitions(header.assembliesOffset, sections[21].Count);
+            typeDefs = ReadAceTypeDefinitions(header.typeDefinitionsOffset, sections[19].Count);
+            methodDefs = ReadAceMethodDefinitions(header.methodsOffset, sections[5].Count);
+            parameterDefs = ReadAceParameterDefinitions(header.parametersOffset, sections[10].Count);
+            fieldDefs = ReadAceFieldDefinitions(header.fieldsOffset, sections[11].Count);
+            var fieldDefaultValues = ReadMetadataClassArray<Il2CppFieldDefaultValue>(header.fieldDefaultValuesOffset, header.fieldDefaultValuesSize);
+            var parameterDefaultValues = ReadMetadataClassArray<Il2CppParameterDefaultValue>(header.parameterDefaultValuesOffset, header.parameterDefaultValuesSize);
+            fieldDefaultValuesDic = fieldDefaultValues.GroupBy(x => x.fieldIndex).ToDictionary(x => x.Key, x => x.First());
+            parameterDefaultValuesDic = parameterDefaultValues.GroupBy(x => x.parameterIndex).ToDictionary(x => x.Key, x => x.First());
+            propertyDefs = ReadMetadataClassArray<Il2CppPropertyDefinition>(header.propertiesOffset, header.propertiesSize);
+            interfaceIndices = ReadClassArray<int>(header.interfacesOffset, header.interfacesSize / 4);
+            nestedTypeIndices = ReadClassArray<int>(header.nestedTypesOffset, header.nestedTypesSize / 4);
+            eventDefs = ReadMetadataClassArray<Il2CppEventDefinition>(header.eventsOffset, header.eventsSize);
+            genericContainers = ReadMetadataClassArray<Il2CppGenericContainer>(header.genericContainersOffset, header.genericContainersSize);
+            RestoreAceGenericContainerIndices();
+            genericParameters = ReadAceGenericParameters(header.genericParametersOffset, sections[12].Count);
+            constraintIndices = ReadClassArray<int>(header.genericParameterConstraintsOffset, header.genericParameterConstraintsSize / 4);
+            vtableMethods = ReadClassArray<uint>(header.vtableMethodsOffset, header.vtableMethodsSize / 4);
+            stringLiterals = ReadAceStringLiterals(header.stringLiteralOffset, sections[0].Count, header.stringLiteralDataSize);
+            fieldRefs = ReadMetadataClassArray<Il2CppFieldRef>(header.fieldRefsOffset, header.fieldRefsSize);
+            attributeTypeRanges = Array.Empty<Il2CppCustomAttributeTypeRange>();
+            attributeTypes = Array.Empty<int>();
+            attributeDataRanges = Array.Empty<Il2CppCustomAttributeDataRange>();
+            metadataUsagesCount = 0;
+            rgctxEntries = Array.Empty<Il2CppRGCTXDefinition>();
+        }
+
+        private void RestoreAceGenericContainerIndices()
+        {
+            for (var i = 0; i < genericContainers.Length; i++)
+            {
+                var genericContainer = genericContainers[i];
+                if (genericContainer.is_method != 0)
+                {
+                    if (genericContainer.ownerIndex >= 0 && genericContainer.ownerIndex < methodDefs.Length)
+                    {
+                        methodDefs[genericContainer.ownerIndex].genericContainerIndex = i;
+                    }
+                }
+                else if (genericContainer.ownerIndex >= 0 && genericContainer.ownerIndex < typeDefs.Length)
+                {
+                    typeDefs[genericContainer.ownerIndex].genericContainerIndex = i;
+                }
+            }
+        }
+
+        private static int ToSize(uint size) => checked((int)size);
+
+        private AceSection[] ReadAceSections(uint firstDword)
+        {
+            if (firstDword != 0)
+            {
+                throw new InvalidDataException("ERROR: ACE metadata header marker is not recognized.");
+            }
+            var sections = new AceSection[31];
+            for (var i = 0; i < sections.Length; i++)
+            {
+                var baseOffset = 8ul + (ulong)i * 12ul;
+                Position = baseOffset;
+                sections[i] = new AceSection(ReadUInt32(), ReadUInt32(), ReadUInt32());
+            }
+            return sections;
+        }
+
+        private static Il2CppGlobalMetadataHeader BuildAceHeader(AceSection[] s)
+        {
+            return new Il2CppGlobalMetadataHeader
+            {
+                sanity = 0xFAB11BAF,
+                version = 24,
+                stringLiteralOffset = s[0].Offset,
+                stringLiteralSize = ToSize(s[0].Size),
+                stringLiteralDataOffset = s[1].Offset,
+                stringLiteralDataSize = ToSize(s[1].Size),
+                stringOffset = s[2].Offset,
+                stringSize = ToSize(s[2].Size),
+                eventsOffset = s[3].Offset,
+                eventsSize = ToSize(s[3].Size),
+                propertiesOffset = s[4].Offset,
+                propertiesSize = ToSize(s[4].Size),
+                methodsOffset = s[5].Offset,
+                methodsSize = ToSize(s[5].Size),
+                parameterDefaultValuesOffset = s[6].Offset,
+                parameterDefaultValuesSize = ToSize(s[6].Size),
+                fieldDefaultValuesOffset = s[7].Offset,
+                fieldDefaultValuesSize = ToSize(s[7].Size),
+                fieldAndParameterDefaultValueDataOffset = s[8].Offset,
+                fieldAndParameterDefaultValueDataSize = ToSize(s[8].Size),
+                fieldMarshaledSizesOffset = (int)s[9].Offset,
+                fieldMarshaledSizesSize = ToSize(s[9].Size),
+                parametersOffset = s[10].Offset,
+                parametersSize = ToSize(s[10].Size),
+                fieldsOffset = s[11].Offset,
+                fieldsSize = ToSize(s[11].Size),
+                genericParametersOffset = s[12].Offset,
+                genericParametersSize = ToSize(s[12].Size),
+                genericParameterConstraintsOffset = s[13].Offset,
+                genericParameterConstraintsSize = ToSize(s[13].Size),
+                genericContainersOffset = s[14].Offset,
+                genericContainersSize = ToSize(s[14].Size),
+                nestedTypesOffset = s[15].Offset,
+                nestedTypesSize = ToSize(s[15].Size),
+                interfacesOffset = s[16].Offset,
+                interfacesSize = ToSize(s[16].Size),
+                vtableMethodsOffset = s[17].Offset,
+                vtableMethodsSize = ToSize(s[17].Size),
+                interfaceOffsetsOffset = (int)s[18].Offset,
+                interfaceOffsetsSize = ToSize(s[18].Size),
+                typeDefinitionsOffset = s[19].Offset,
+                typeDefinitionsSize = ToSize(s[19].Size),
+                imagesOffset = s[20].Offset,
+                imagesSize = ToSize(s[20].Size),
+                assembliesOffset = s[21].Offset,
+                assembliesSize = ToSize(s[21].Size),
+                fieldRefsOffset = s[22].Offset,
+                fieldRefsSize = ToSize(s[22].Size),
+                referencedAssembliesOffset = (int)s[23].Offset,
+                referencedAssembliesSize = ToSize(s[23].Size),
+                attributeDataOffset = s[24].Offset,
+                attributeDataSize = ToSize(s[24].Size),
+                attributeDataRangeOffset = s[25].Offset,
+                attributeDataRangeSize = ToSize(s[25].Size),
+                unresolvedVirtualCallParameterTypesOffset = (int)s[26].Offset,
+                unresolvedVirtualCallParameterTypesSize = ToSize(s[26].Size),
+                unresolvedVirtualCallParameterRangesOffset = (int)s[27].Offset,
+                unresolvedVirtualCallParameterRangesSize = ToSize(s[27].Size),
+                exportedTypeDefinitionsOffset = (int)s[30].Offset,
+                exportedTypeDefinitionsSize = ToSize(s[30].Size),
+            };
+        }
+
+        private Il2CppImageDefinition[] ReadAceImageDefinitions(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppImageDefinition[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                var entry = (ulong)addr + (ulong)i * 36ul;
+                Position = entry;
+                var imageDef = new Il2CppImageDefinition
+                {
+                    nameIndex = ReadUInt32(),
+                    assemblyIndex = ReadInt32()
+                };
+                var packedType = ReadUInt32();
+                imageDef.typeStart = (int)(packedType & 0xffff);
+                imageDef.typeCount = packedType >> 16;
+                Position = entry + 0x14;
+                imageDef.entryPointIndex = ReadInt32();
+                imageDef.token = ReadUInt32();
+                imageDef.exportedTypeStart = -1;
+                imageDef.exportedTypeCount = 0;
+                imageDef.customAttributeStart = -1;
+                imageDef.customAttributeCount = 0;
+                result[i] = imageDef;
+            }
+            return result;
+        }
+
+        private Il2CppAssemblyDefinition[] ReadAceAssemblyDefinitions(uint addr, uint count)
+        {
+            var result = new Il2CppAssemblyDefinition[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                var entry = (ulong)addr + (ulong)i * 68ul;
+                Position = entry;
+                var assemblyDef = new Il2CppAssemblyDefinition
+                {
+                    imageIndex = ReadInt32(),
+                    token = ReadUInt32(),
+                    customAttributeIndex = ReadInt32(),
+                    referencedAssemblyStart = ReadInt32(),
+                    referencedAssemblyCount = ReadInt32(),
+                    aname = new Il2CppAssemblyNameDefinition
+                    {
+                        nameIndex = ReadUInt32(),
+                        cultureIndex = ReadUInt32(),
+                        hashValueIndex = ReadInt32(),
+                        publicKeyIndex = ReadUInt32(),
+                        hash_alg = ReadUInt32(),
+                        hash_len = ReadInt32(),
+                        flags = ReadUInt32(),
+                        major = ReadInt32(),
+                        minor = ReadInt32(),
+                        build = ReadInt32(),
+                        revision = ReadInt32(),
+                        public_key_token = ReadBytes(8)
+                    }
+                };
+                result[i] = assemblyDef;
+            }
+            return result;
+        }
+
+        private Il2CppTypeDefinition[] ReadAceTypeDefinitions(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppTypeDefinition[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                var entry = (ulong)addr + (ulong)i * 82ul;
+                Position = entry;
+                var typeDef = new Il2CppTypeDefinition
+                {
+                    nameIndex = ReadUInt32(),
+                    namespaceIndex = ReadUInt32(),
+                    byvalTypeIndex = ReadInt32(),
+                    byrefTypeIndex = -1,
+                    declaringTypeIndex = ReadInt32(),
+                    parentIndex = ReadInt32()
+                };
+                Position = entry + 0x18;
+                typeDef.flags = ReadUInt16();
+                typeDef.fieldStart = ReadUInt16();
+                // methodStart 在 entry+0x1c 被压成 16 位会溢出，改为读完 method 表后用前缀和重建（见下方循环）
+                Position = entry + 0x32;
+                typeDef.vtableStart = ReadUInt16();
+                Position = entry + 0x3a;
+                typeDef.method_count = ReadUInt16();
+                typeDef.property_count = ReadUInt16();
+                typeDef.field_count = ReadUInt16();
+                typeDef.event_count = ReadUInt16();
+                typeDef.nested_type_count = ReadUInt16();
+                typeDef.vtable_count = ReadUInt16();
+                typeDef.interfaces_count = ReadUInt16();
+                typeDef.interface_offsets_count = ReadUInt16();
+                Position = entry + 0x4a;
+                typeDef.bitfield = ReadUInt32();
+                Position = entry + 0x4e;
+                typeDef.token = ReadUInt32();
+                typeDef.customAttributeIndex = -1;
+                typeDef.elementTypeIndex = -1;
+                typeDef.rgctxStartIndex = -1;
+                typeDef.rgctxCount = 0;
+                typeDef.genericContainerIndex = -1;
+                typeDef.delegateWrapperFromManagedToNativeIndex = -1;
+                typeDef.marshalingFunctionsIndex = -1;
+                typeDef.ccwFunctionIndex = -1;
+                typeDef.guidIndex = -1;
+                typeDef.eventStart = -1;
+                typeDef.propertyStart = -1;
+                typeDef.nestedTypesStart = -1;
+                typeDef.interfacesStart = -1;
+                typeDef.interfaceOffsetsStart = -1;
+                result[i] = typeDef;
+            }
+            // ACE 把 typeDef.methodStart 压缩成 16 位（entry+0x1c 高 16 位），方法总数 >65535 时溢出饱和，
+            // 导致各 type 的方法区间坍缩重叠。method 表按 type 连续分块、method_count 又准确，
+            // 故用前缀和重建 methodStart（与标准 IL2CPP 的累积语义一致）。
+            int methodAcc = 0;
+            for (var i = 0; i < result.Length; i++)
+            {
+                result[i].methodStart = methodAcc;
+                methodAcc += result[i].method_count;
+            }
+            return result;
+        }
+
+        private Il2CppMethodDefinition[] ReadAceMethodDefinitions(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppMethodDefinition[count];
+            var parameterStart = 0;
+            for (var i = 0; i < result.Length; i++)
+            {
+                var entry = (ulong)addr + (ulong)i * 32ul;
+                Position = entry;
+                var method = new Il2CppMethodDefinition
+                {
+                    nameIndex = ReadUInt32()
+                };
+                var packedDeclaringType = ReadUInt32();
+                method.declaringType = (int)(packedDeclaringType & 0xffff);
+                method.returnType = -1;
+                Position = entry + 0x10;
+                method.genericContainerIndex = ReadInt32();
+                method.token = ReadUInt32();
+                method.flags = ReadUInt16();
+                method.iflags = ReadUInt16();
+                method.slot = ReadUInt16();
+                Position = entry + 0x1c;
+                var packedParamCount = ReadUInt32();
+                method.parameterCount = (ushort)(packedParamCount >> 16);
+                method.parameterStart = parameterStart;
+                parameterStart += method.parameterCount;
+                method.customAttributeIndex = -1;
+                method.methodIndex = -1;
+                method.invokerIndex = -1;
+                method.delegateWrapperIndex = -1;
+                method.rgctxStartIndex = -1;
+                method.rgctxCount = 0;
+                result[i] = method;
+            }
+            return result;
+        }
+
+        private Il2CppFieldDefinition[] ReadAceFieldDefinitions(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppFieldDefinition[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                result[i] = new Il2CppFieldDefinition
+                {
+                    nameIndex = ReadUInt32(),
+                    typeIndex = ReadInt32(),
+                    token = ReadUInt32(),
+                    customAttributeIndex = -1
+                };
+            }
+            return result;
+        }
+
+        private Il2CppParameterDefinition[] ReadAceParameterDefinitions(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppParameterDefinition[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                result[i] = new Il2CppParameterDefinition
+                {
+                    nameIndex = ReadUInt32(),
+                    token = ReadUInt32(),
+                    typeIndex = ReadInt32(),
+                    customAttributeIndex = -1
+                };
+            }
+            return result;
+        }
+
+        private Il2CppGenericParameter[] ReadAceGenericParameters(uint addr, uint count)
+        {
+            Position = addr;
+            var result = new Il2CppGenericParameter[count];
+            for (var i = 0; i < result.Length; i++)
+            {
+                var entry = (ulong)addr + (ulong)i * 14ul;
+                Position = entry;
+                result[i] = new Il2CppGenericParameter
+                {
+                    ownerIndex = ReadUInt16(),
+                    nameIndex = ReadUInt32(),
+                    constraintsStart = ReadInt16(),
+                    constraintsCount = ReadInt16(),
+                    num = ReadUInt16(),
+                    flags = ReadUInt16()
+                };
+            }
+            return result;
+        }
+
+        private Il2CppStringLiteral[] ReadAceStringLiterals(uint addr, uint count, int dataSize)
+        {
+            Position = addr;
+            var offsets = new uint[count + 1];
+            for (var i = 0; i < count; i++)
+            {
+                offsets[i] = ReadUInt32();
+            }
+            offsets[count] = (uint)dataSize;
+            var result = new Il2CppStringLiteral[count];
+            for (var i = 0; i < count; i++)
+            {
+                result[i] = new Il2CppStringLiteral
+                {
+                    dataIndex = (int)offsets[i],
+                    length = offsets[i + 1] - offsets[i]
+                };
+            }
+            return result;
+        }
+
+        private readonly record struct AceSection(uint Offset, uint Size, uint Count);
 
         private T[] ReadMetadataClassArray<T>(uint addr, int count) where T : new()
         {

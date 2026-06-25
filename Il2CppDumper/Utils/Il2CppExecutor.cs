@@ -60,6 +60,22 @@ namespace Il2CppDumper
 
         public string GetTypeName(Il2CppType il2CppType, bool addNamespace, bool is_nested)
         {
+            try
+            {
+                return GetTypeNameUnsafe(il2CppType, addNamespace, is_nested);
+            }
+            catch
+            {
+                if (il2CppType == null)
+                {
+                    return "type_null";
+                }
+                return $"type_{(int)il2CppType.type}_{il2CppType.data.dummy:X}";
+            }
+        }
+
+        private string GetTypeNameUnsafe(Il2CppType il2CppType, bool addNamespace, bool is_nested)
+        {
             switch (il2CppType.type)
             {
                 case Il2CppTypeEnum.IL2CPP_TYPE_ARRAY:
@@ -82,6 +98,10 @@ namespace Il2CppDumper
                 case Il2CppTypeEnum.IL2CPP_TYPE_MVAR:
                     {
                         var param = GetGenericParameteFromIl2CppType(il2CppType);
+                        if (param == null)
+                        {
+                            return il2CppType.type == Il2CppTypeEnum.IL2CPP_TYPE_MVAR ? $"M{il2CppType.data.genericParameterIndex}" : $"T{il2CppType.data.genericParameterIndex}";
+                        }
                         return metadata.GetStringFromIndex(param.nameIndex);
                     }
                 case Il2CppTypeEnum.IL2CPP_TYPE_CLASS:
@@ -181,7 +201,15 @@ namespace Il2CppDumper
         public string GetGenericInstParams(Il2CppGenericInst genericInst)
         {
             var genericParameterNames = new List<string>();
-            var pointers = il2Cpp.MapVATR<ulong>(genericInst.type_argv, genericInst.type_argc);
+            ulong[] pointers;
+            try
+            {
+                pointers = il2Cpp.MapVATR<ulong>(genericInst.type_argv, genericInst.type_argc);
+            }
+            catch
+            {
+                return "<T>";
+            }
             for (int i = 0; i < genericInst.type_argc; i++)
             {
                 var il2CppType = il2Cpp.GetIl2CppType(pointers[i]);
@@ -196,24 +224,44 @@ namespace Il2CppDumper
             for (int i = 0; i < genericContainer.type_argc; i++)
             {
                 var genericParameterIndex = genericContainer.genericParameterStart + i;
+                if (genericParameterIndex < 0 || genericParameterIndex >= metadata.genericParameters.Length)
+                {
+                    genericParameterNames.Add($"T{i}");
+                    continue;
+                }
                 var genericParameter = metadata.genericParameters[genericParameterIndex];
-                genericParameterNames.Add(metadata.GetStringFromIndex(genericParameter.nameIndex));
+                try
+                {
+                    genericParameterNames.Add(metadata.GetStringFromIndex(genericParameter.nameIndex));
+                }
+                catch
+                {
+                    genericParameterNames.Add($"T{i}");
+                }
             }
             return $"<{string.Join(", ", genericParameterNames)}>";
         }
 
         public (string, string) GetMethodSpecName(Il2CppMethodSpec methodSpec, bool addNamespace = false)
         {
+            if (methodSpec.methodDefinitionIndex < 0 || methodSpec.methodDefinitionIndex >= metadata.methodDefs.Length)
+            {
+                return ($"methodSpecType_{methodSpec.methodDefinitionIndex}", "methodSpec");
+            }
             var methodDef = metadata.methodDefs[methodSpec.methodDefinitionIndex];
+            if (methodDef.declaringType < 0 || methodDef.declaringType >= metadata.typeDefs.Length)
+            {
+                return ($"type_{methodDef.declaringType}", metadata.GetStringFromIndex(methodDef.nameIndex));
+            }
             var typeDef = metadata.typeDefs[methodDef.declaringType];
             var typeName = GetTypeDefName(typeDef, addNamespace, false);
-            if (methodSpec.classIndexIndex != -1)
+            if (methodSpec.classIndexIndex >= 0 && methodSpec.classIndexIndex < il2Cpp.genericInsts.Length)
             {
                 var classInst = il2Cpp.genericInsts[methodSpec.classIndexIndex];
                 typeName += GetGenericInstParams(classInst);
             }
             var methodName = metadata.GetStringFromIndex(methodDef.nameIndex);
-            if (methodSpec.methodIndexIndex != -1)
+            if (methodSpec.methodIndexIndex >= 0 && methodSpec.methodIndexIndex < il2Cpp.genericInsts.Length)
             {
                 var methodInst = il2Cpp.genericInsts[methodSpec.methodIndexIndex];
                 methodName += GetGenericInstParams(methodInst);
@@ -225,11 +273,11 @@ namespace Il2CppDumper
         {
             var classInstPointer = 0ul;
             var methodInstPointer = 0ul;
-            if (methodSpec.classIndexIndex != -1)
+            if (methodSpec.classIndexIndex >= 0 && methodSpec.classIndexIndex < il2Cpp.genericInstPointers.Length)
             {
                 classInstPointer = il2Cpp.genericInstPointers[methodSpec.classIndexIndex];
             }
-            if (methodSpec.methodIndexIndex != -1)
+            if (methodSpec.methodIndexIndex >= 0 && methodSpec.methodIndexIndex < il2Cpp.genericInstPointers.Length)
             {
                 methodInstPointer = il2Cpp.genericInstPointers[methodSpec.methodIndexIndex];
             }
@@ -241,7 +289,10 @@ namespace Il2CppDumper
             Il2CppRGCTXDefinition[] collection = null;
             if (il2Cpp.Version >= 24.2)
             {
-                il2Cpp.rgctxsDictionary[imageName].TryGetValue(typeDef.token, out collection);
+                if (il2Cpp.rgctxsDictionary.TryGetValue(imageName, out var rgctxs))
+                {
+                    rgctxs.TryGetValue(typeDef.token, out collection);
+                }
             }
             else
             {
@@ -259,7 +310,10 @@ namespace Il2CppDumper
             Il2CppRGCTXDefinition[] collection = null;
             if (il2Cpp.Version >= 24.2)
             {
-                il2Cpp.rgctxsDictionary[imageName].TryGetValue(methodDef.token, out collection);
+                if (il2Cpp.rgctxsDictionary.TryGetValue(imageName, out var rgctxs))
+                {
+                    rgctxs.TryGetValue(methodDef.token, out collection);
+                }
             }
             else
             {
@@ -314,7 +368,12 @@ namespace Il2CppDumper
             }
             else
             {
-                return metadata.genericParameters[il2CppType.data.genericParameterIndex];
+                var index = il2CppType.data.genericParameterIndex;
+                if (index < 0 || index >= metadata.genericParameters.Length)
+                {
+                    return null;
+                }
+                return metadata.genericParameters[index];
             }
         }
 

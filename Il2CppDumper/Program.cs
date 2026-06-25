@@ -42,6 +42,10 @@ namespace Il2CppDumper
                         {
                             metadataPath = arg;
                         }
+                        else if (config.UseAceMetadataLayout && Path.GetFileName(arg).Equals("global-metadata.dat", StringComparison.OrdinalIgnoreCase))
+                        {
+                            metadataPath = arg;
+                        }
                         else
                         {
                             il2cppPath = arg;
@@ -120,7 +124,7 @@ namespace Il2CppDumper
         {
             Console.WriteLine("Initializing metadata...");
             var metadataBytes = File.ReadAllBytes(metadataPath);
-            metadata = new Metadata(new MemoryStream(metadataBytes));
+            metadata = new Metadata(new MemoryStream(metadataBytes), config.UseAceMetadataLayout);
             Console.WriteLine($"Metadata Version: {metadata.Version}");
 
             Console.WriteLine("Initializing il2cpp file...");
@@ -180,6 +184,7 @@ namespace Il2CppDumper
             }
             var version = config.ForceIl2CppVersion ? config.ForceVersion : metadata.Version;
             il2Cpp.SetProperties(version, metadata.metadataUsagesCount);
+            il2Cpp.IsAceMetadataLayout = metadata.IsAceMetadataLayout;
             Console.WriteLine($"Il2Cpp Version: {il2Cpp.Version}");
             if (config.ForceDump || il2Cpp.CheckDump())
             {
@@ -207,7 +212,8 @@ namespace Il2CppDumper
             Console.WriteLine("Searching...");
             try
             {
-                var flag = il2Cpp.PlusSearch(metadata.methodDefs.Count(x => x.methodIndex >= 0), metadata.typeDefs.Length, metadata.imageDefs.Length);
+                var searchMethodCount = metadata.IsAceMetadataLayout ? metadata.methodDefs.Length : metadata.methodDefs.Count(x => x.methodIndex >= 0);
+                var flag = il2Cpp.PlusSearch(searchMethodCount, metadata.typeDefs.Length, metadata.imageDefs.Length);
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
                     if (!flag && il2Cpp is PE)
@@ -215,7 +221,7 @@ namespace Il2CppDumper
                         Console.WriteLine("Use custom PE loader");
                         il2Cpp = PELoader.Load(il2cppPath);
                         il2Cpp.SetProperties(version, metadata.metadataUsagesCount);
-                        flag = il2Cpp.PlusSearch(metadata.methodDefs.Count(x => x.methodIndex >= 0), metadata.typeDefs.Length, metadata.imageDefs.Length);
+                        flag = il2Cpp.PlusSearch(searchMethodCount, metadata.typeDefs.Length, metadata.imageDefs.Length);
                     }
                 }
                 if (!flag)
